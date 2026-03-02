@@ -45,6 +45,18 @@ export class UploadService {
     deviceIdOverride?: string // For annotation sync path without stats
   ) {
     return db.transaction(async (trx) => {
+      // Normalize: the plugin sends {} (empty Lua table → JSON object) on the
+      // annotation-only path, not []. Guard all array operations against this,
+      // and drop clearly invalid page stat rows.
+      const safePageStats = (Array.isArray(newPageStats) ? newPageStats : []).filter(
+        (s) =>
+          s != null &&
+          typeof s === 'object' &&
+          Number.isFinite(s.duration) &&
+          s.duration > 0 &&
+          Number.isFinite(s.total_pages) &&
+          s.total_pages > 0
+      );
       // Insert books
       const newBooks: Partial<Book>[] = booksToImport.map((book) => ({
         id: book.id,
@@ -60,10 +72,8 @@ export class UploadService {
       );
 
       // Determine device ID: from stats, override, or fall back to unknown device
-      const deviceId =
-        newPageStats.length > 0
-          ? newPageStats[0].device_id
-          : deviceIdOverride || this.UNKNOWN_DEVICE_ID;
+      const firstValidStat = safePageStats.find((s) => s.device_id);
+      const deviceId = firstValidStat?.device_id ?? deviceIdOverride ?? this.UNKNOWN_DEVICE_ID;
 
       const hasUnknownDevices = deviceId === this.UNKNOWN_DEVICE_ID;
 
@@ -97,8 +107,14 @@ export class UploadService {
           const { book_md5, device_id, total_read_time, total_read_pages, ...otherFields } =
             bookDevice;
 
-          // Always merge these fields
-          const fieldsToMerge: (keyof BookDevice)[] = ['last_open', 'pages', 'notes', 'highlights'];
+          // Always merge these fields (last_open added conditionally below)
+          const fieldsToMerge: (keyof BookDevice)[] = ['pages', 'notes', 'highlights'];
+
+          // Only merge last_open if it's a valid positive Unix timestamp (seconds)
+          const last_open = bookDevice.last_open;
+          if (Number.isFinite(last_open) && last_open > 0) {
+            fieldsToMerge.push('last_open');
+          }
 
           // Only merge statistics fields if they have actual values (if on statistics.db sync path)
           // This prevents annotation-only syncs from overwriting with zeros
@@ -116,10 +132,10 @@ export class UploadService {
         })
       );
 
-      // Insert page stats (only on stats sync path! there are non for annotation sync path)
-      if (newPageStats.length > 0) {
+      // Insert page stats (only on stats sync path! there are none for annotation sync path)
+      if (safePageStats.length > 0) {
         await Promise.all(
-          newPageStats.map((pageStat) =>
+          safePageStats.map((pageStat) =>
             trx<PageStat>('page_stat')
               .insert(pageStat)
               .onConflict(['device_id', 'book_md5', 'page', 'start_time'])
